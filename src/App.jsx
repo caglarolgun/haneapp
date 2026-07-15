@@ -2,12 +2,13 @@ import { useState, useEffect, useMemo } from "react";
 import {
   Plus, X, Trash2, ChevronLeft, ChevronRight, Wallet,
   ArrowUpRight, ArrowDownRight, BookOpen, PiggyBank, LineChart as LineChartIcon, CreditCard,
-  User, Lock, LogIn, UserPlus
+  User, Lock, LogIn, UserPlus, LogOut, Mail
 } from "lucide-react";
 import {
   PieChart, Pie, Cell, Tooltip, ResponsiveContainer,
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Legend
 } from "recharts";
+import { supabase } from "./supabaseClient.js";
 
 const MONTHS_TR = ["Oca","Şub","Mar","Nis","May","Haz","Tem","Ağu","Eyl","Eki","Kas","Ara"];
 const MONTHS_TR_FULL = ["Ocak","Şubat","Mart","Nisan","Mayıs","Haziran","Temmuz","Ağustos","Eylül","Ekim","Kasım","Aralık"];
@@ -81,65 +82,101 @@ export default function HaneDefteri() {
   const [monthOffset, setMonthOffset] = useState(0);
   const [addingCategory, setAddingCategory] = useState(false);
   const [addingCard, setAddingCard] = useState(false);
-  const [hasAccount, setHasAccount] = useState(false);
-  const [storedUser, setStoredUser] = useState(null);
   const [authed, setAuthed] = useState(false);
   const [authError, setAuthError] = useState("");
 
   useEffect(() => { load(); }, []);
 
   async function load() {
-    try {
-      const res = await window.storage.get("ledger-data", false);
-      if (res && res.value) {
-        const data = JSON.parse(res.value);
-        setTransactions(data.transactions || []);
-        setExpenseCats(data.expenseCats && data.expenseCats.length ? data.expenseCats : DEFAULT_EXPENSE);
-        setIncomeCats(data.incomeCats && data.incomeCats.length ? data.incomeCats : DEFAULT_INCOME);
-        setCards(data.cards && data.cards.length ? data.cards : DEFAULT_CARDS);
-      }
-    } catch (e) {
-      // no data yet, defaults stand
+    const { data: sessionData } = await supabase.auth.getSession();
+    const session = sessionData?.session;
+    if (session) {
+      setAuthed(true);
+      await loadUserData(session.user.id);
     }
+    setLoading(false);
+  }
+
+  async function loadUserData(userId) {
     try {
-      const authRes = await window.storage.get("auth-cred", false);
-      if (authRes && authRes.value) {
-        const cred = JSON.parse(authRes.value);
-        setStoredUser(cred);
-        setHasAccount(true);
+      const { data } = await supabase.from("user_data").select("data").eq("user_id", userId).single();
+      const d = data?.data;
+      if (d) {
+        setTransactions(d.transactions || []);
+        setExpenseCats(d.expenseCats && d.expenseCats.length ? d.expenseCats : DEFAULT_EXPENSE);
+        setIncomeCats(d.incomeCats && d.incomeCats.length ? d.incomeCats : DEFAULT_INCOME);
+        setCards(d.cards && d.cards.length ? d.cards : DEFAULT_CARDS);
       }
     } catch (e) {
-      // no account yet, setup mode
-    } finally {
-      setLoading(false);
+      // ilk giriş, henüz satır yok — varsayılanlar kalır
     }
   }
 
-  async function handleSetup(username, password) {
+  function mapAuthError(error) {
+    const msg = error?.message || "";
+    if (msg.includes("already registered")) return "Bu e-posta zaten kayıtlı.";
+    if (msg.includes("Password should be at least")) return "Şifre en az 6 karakter olmalı.";
+    if (msg.includes("Invalid login")) return "E-posta veya şifre hatalı.";
+    if (msg.includes("Email not confirmed")) return "E-postanı henüz onaylamadın. Gelen kutunu kontrol et.";
+    return "Bir sorun oluştu, tekrar dene.";
+  }
+
+  async function handleSetup(username, email, password) {
     setAuthError("");
-    const cred = { username: username.trim(), password };
     try {
-      await window.storage.set("auth-cred", JSON.stringify(cred), false);
-      setStoredUser(cred);
-      setHasAccount(true);
-      setAuthed(true);
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: { data: { username: username.trim() } },
+      });
+      if (error) { setAuthError(mapAuthError(error)); return { ok: false }; }
+      if (data.session) {
+        setAuthed(true);
+        await loadUserData(data.user.id);
+        return { ok: true, confirmed: true };
+      }
+      return { ok: true, confirmed: false };
     } catch (e) {
       setAuthError("Hesap oluşturulamadı, tekrar dene.");
+      return { ok: false };
     }
   }
 
-  function handleLogin(username, password) {
+  async function handleLogin(email, password) {
     setAuthError("");
-    if (storedUser && username.trim() === storedUser.username && password === storedUser.password) {
+    try {
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error) { setAuthError(mapAuthError(error)); return { ok: false }; }
       setAuthed(true);
-    } else {
-      setAuthError("Kullanıcı adı veya şifre hatalı.");
+      await loadUserData(data.user.id);
+      return { ok: true };
+    } catch (e) {
+      setAuthError("Giriş yapılamadı, tekrar dene.");
+      return { ok: false };
     }
+  }
+
+  async function handleLogout() {
+    await supabase.auth.signOut();
+    setAuthed(false);
+    setTransactions([]);
+    setExpenseCats(DEFAULT_EXPENSE);
+    setIncomeCats(DEFAULT_INCOME);
+    setCards(DEFAULT_CARDS);
+    setTab("ozet");
   }
 
   async function persist(ec, ic, tx, crds) {
     try {
-      await window.storage.set("ledger-data", JSON.stringify({ expenseCats: ec, incomeCats: ic, transactions: tx, cards: crds }), false);
+      const { data: sessionData } = await supabase.auth.getSession();
+      const userId = sessionData?.session?.user?.id;
+      if (!userId) return;
+      const { error } = await supabase.from("user_data").upsert({
+        user_id: userId,
+        data: { expenseCats: ec, incomeCats: ic, transactions: tx, cards: crds },
+        updated_at: new Date().toISOString(),
+      });
+      if (error) throw error;
       setSaveError(false);
     } catch (e) {
       setSaveError(true);
@@ -268,7 +305,6 @@ export default function HaneDefteri() {
   if (!authed) {
     return (
       <AuthGate
-        mode={hasAccount ? "login" : "setup"}
         onLogin={handleLogin}
         onSetup={handleSetup}
         error={authError}
@@ -284,6 +320,9 @@ export default function HaneDefteri() {
         <div className="hd-cover-top">
           <BookOpen size={20} />
           <span className="hd-cover-title">HANE DEFTERİ</span>
+          <button className="hd-logout-btn" onClick={handleLogout} aria-label="Çıkış yap">
+            <LogOut size={16} />
+          </button>
         </div>
         <div className="hd-cover-balance-label">Toplam Bakiye</div>
         <div className="hd-cover-balance">{fmt(allTimeBalance)}</div>
@@ -402,19 +441,60 @@ function HaneLogo({ size = 64 }) {
   );
 }
 
-function AuthGate({ mode, onLogin, onSetup, error }) {
+function AuthGate({ onLogin, onSetup, error }) {
+  const [mode, setMode] = useState("login");
   const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [pendingEmail, setPendingEmail] = useState(null);
   const isSetup = mode === "setup";
 
-  function submit() {
-    if (!username.trim() || !password) return;
-    if (isSetup) onSetup(username, password);
-    else onLogin(username, password);
+  async function submit() {
+    if (!email.trim() || !password || submitting) return;
+    if (isSetup && !username.trim()) return;
+    setSubmitting(true);
+    if (isSetup) {
+      const res = await onSetup(username, email.trim(), password);
+      if (res?.ok && !res.confirmed) setPendingEmail(email.trim());
+    } else {
+      await onLogin(email.trim(), password);
+    }
+    setSubmitting(false);
   }
 
   function handleKeyDown(e) {
     if (e.key === "Enter") submit();
+  }
+
+  function switchMode(next) {
+    setMode(next);
+    setPendingEmail(null);
+  }
+
+  if (pendingEmail) {
+    return (
+      <div className="hd-auth-root">
+        <style>{CSS}</style>
+        <div className="hd-auth-card">
+          <div className="hd-auth-logo"><HaneLogo size={64} /></div>
+          <h1 className="hd-auth-title">Hane App</h1>
+          <div className="hd-auth-pending-icon">✉️</div>
+          <div className="hd-auth-pending-text">
+            <strong>{pendingEmail}</strong> adresine bir onay maili gönderdik.
+            Gelen kutunu (ve spam klasörünü) kontrol edip linke tıkla, sonra giriş yap.
+          </div>
+          <button type="button" className="hd-btn-primary hd-auth-submit" onClick={() => switchMode("login")}>
+            Giriş ekranına dön
+          </button>
+        </div>
+        <div className="hd-auth-footer">
+          <div className="hd-auth-slogan">"Hanemize hayırlı olsun"</div>
+          <div className="hd-auth-copyright">© {new Date().getFullYear()} Hane App. Tüm hakları saklıdır.</div>
+          <div className="hd-auth-credit">Mila Soft Yazılım</div>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -428,17 +508,35 @@ function AuthGate({ mode, onLogin, onSetup, error }) {
         <div className="hd-auth-subtitle">{isSetup ? "Hesabını oluştur" : "Hesabına giriş yap"}</div>
 
         <div className="hd-auth-form">
-          <label className="hd-field-label">Kullanıcı Adı</label>
+          {isSetup && (
+            <>
+              <label className="hd-field-label">Kullanıcı Adı</label>
+              <div className="hd-auth-input-wrap">
+                <User size={16} />
+                <input
+                  className="hd-auth-input"
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  placeholder="görünen adın"
+                  autoComplete="name"
+                />
+              </div>
+            </>
+          )}
+
+          <label className="hd-field-label">E-posta</label>
           <div className="hd-auth-input-wrap">
-            <User size={16} />
+            <Mail size={16} />
             <input
               className="hd-auth-input"
-              type="text"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="kullanıcı adı"
-              autoComplete="username"
+              placeholder="ornek@eposta.com"
+              autoComplete="email"
             />
           </div>
 
@@ -458,8 +556,12 @@ function AuthGate({ mode, onLogin, onSetup, error }) {
 
           {error && <div className="hd-form-error">{error}</div>}
 
-          <button type="button" className="hd-btn-primary hd-auth-submit" onClick={submit}>
-            {isSetup ? <><UserPlus size={16} /> Hesap Oluştur</> : <><LogIn size={16} /> Giriş Yap</>}
+          <button type="button" className="hd-btn-primary hd-auth-submit" onClick={submit} disabled={submitting}>
+            {submitting ? "Bir saniye…" : isSetup ? <><UserPlus size={16} /> Hesap Oluştur</> : <><LogIn size={16} /> Giriş Yap</>}
+          </button>
+
+          <button type="button" className="hd-auth-switch" onClick={() => switchMode(isSetup ? "login" : "setup")}>
+            {isSetup ? "Zaten hesabın var mı? Giriş yap" : "Hesabın yok mu? Hesap oluştur"}
           </button>
         </div>
       </div>
@@ -932,6 +1034,7 @@ const CSS = `
   box-shadow: 0 4px 14px rgba(0,0,0,0.15);
 }
 .hd-cover-top { display: flex; align-items: center; gap: 8px; opacity: 0.9; }
+.hd-logout-btn { margin-left: auto; background: rgba(255,255,255,0.15); border: none; color: #fff; width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; }
 .hd-cover-title { font-family: 'Fraunces', serif; font-weight: 600; letter-spacing: 2px; font-size: 13px; }
 .hd-cover-balance-label { font-size: 12px; opacity: 0.8; margin-top: 14px; }
 .hd-cover-balance { font-family: 'JetBrains Mono', monospace; font-size: 32px; font-weight: 600; margin-top: 2px; }
@@ -1110,6 +1213,10 @@ const CSS = `
 .hd-auth-input-wrap:focus-within { border-color: #3E6B6E; color: #3E6B6E; }
 .hd-auth-input { border: none; outline: none; flex: 1; font-size: 14px; color: #2C3E50; font-family: 'Inter', sans-serif; }
 .hd-auth-submit { width: 100%; margin-top: 16px; display: flex; align-items: center; justify-content: center; gap: 6px; }
+.hd-auth-submit:disabled { opacity: 0.7; cursor: default; }
+.hd-auth-switch { background: none; border: none; color: #7A8894; font-size: 12px; margin-top: 14px; cursor: pointer; text-decoration: underline; }
+.hd-auth-pending-icon { font-size: 34px; margin: 8px 0 6px; }
+.hd-auth-pending-text { text-align: center; font-size: 13px; color: #4A5A67; line-height: 1.5; margin-bottom: 18px; }
 .hd-auth-footer { margin-top: 28px; text-align: center; }
 .hd-auth-slogan { font-family: 'Fraunces', serif; font-style: italic; font-size: 14px; color: #3E6B6E; margin-bottom: 6px; }
 .hd-auth-copyright { font-size: 11px; color: #A9B4BD; }
